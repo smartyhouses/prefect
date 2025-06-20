@@ -34,6 +34,7 @@ from typing_extensions import Literal, Self
 
 from prefect._internal.schemas.validators import (
     get_or_create_run_name,
+    list_length_50_or_less,
     set_run_policy_deprecated_fields,
     validate_cache_key_length,
     validate_default_queue_id_not_none,
@@ -356,7 +357,7 @@ class TaskRunPolicy(PrefectBaseModel):
         deprecated=True,
     )
     retries: Optional[int] = Field(default=None, description="The number of retries.")
-    retry_delay: Union[None, int, List[int]] = Field(
+    retry_delay: Union[None, int, float, List[int], List[float]] = Field(
         default=None,
         description="A delay time or list of delay times between retries, in seconds.",
     )
@@ -371,11 +372,9 @@ class TaskRunPolicy(PrefectBaseModel):
     @field_validator("retry_delay")
     @classmethod
     def validate_configured_retry_delays(
-        cls, v: int | list[int] | None
-    ) -> int | list[int] | None:
-        if isinstance(v, list) and (len(v) > 50):
-            raise ValueError("Can not configure more than 50 retry delays per task.")
-        return v
+        cls, v: int | float | list[int] | list[float] | None
+    ) -> int | float | list[int] | list[float] | None:
+        return list_length_50_or_less(v)
 
     @field_validator("retry_jitter_factor")
     @classmethod
@@ -383,10 +382,10 @@ class TaskRunPolicy(PrefectBaseModel):
         return validate_not_negative(v)
 
 
-class TaskRunInput(PrefectBaseModel):
+class RunInput(PrefectBaseModel):
     """
-    Base class for classes that represent inputs to task runs, which
-    could include, constants, parameters, or other task runs.
+    Base class for classes that represent inputs to runs, which
+    could include, constants, parameters, task runs or flow runs.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
@@ -394,21 +393,26 @@ class TaskRunInput(PrefectBaseModel):
     input_type: str
 
 
-class TaskRunResult(TaskRunInput):
+class TaskRunResult(RunInput):
     """Represents a task run result input to another task run."""
 
     input_type: Literal["task_run"] = "task_run"
     id: UUID
 
 
-class Parameter(TaskRunInput):
+class FlowRunResult(RunInput):
+    input_type: Literal["flow_run"] = "flow_run"
+    id: UUID
+
+
+class Parameter(RunInput):
     """Represents a parameter input to a task run."""
 
     input_type: Literal["parameter"] = "parameter"
     name: str
 
 
-class Constant(TaskRunInput):
+class Constant(RunInput):
     """Represents constant input value to a task run."""
 
     input_type: Literal["constant"] = "constant"
@@ -464,7 +468,9 @@ class TaskRun(TimeSeriesBaseModel, ORMBaseModel):
     state_id: Optional[UUID] = Field(
         default=None, description="The id of the current task run state."
     )
-    task_inputs: Dict[str, List[Union[TaskRunResult, Parameter, Constant]]] = Field(
+    task_inputs: Dict[
+        str, List[Union[TaskRunResult, FlowRunResult, Parameter, Constant]]
+    ] = Field(
         default_factory=dict,
         description=(
             "Tracks the source of inputs to a task run. Used for internal bookkeeping."

@@ -17,7 +17,13 @@ from prefect.client.schemas.filters import (
     FlowRunFilterParentFlowRunId,
     TaskRunFilter,
 )
-from prefect.client.schemas.objects import Constant, FlowRun, Parameter, TaskRunResult
+from prefect.client.schemas.objects import (
+    Constant,
+    FlowRun,
+    FlowRunResult,
+    Parameter,
+    TaskRunResult,
+)
 from prefect.context import FlowRunContext
 from prefect.flows import Flow
 from prefect.logging import get_logger
@@ -66,9 +72,9 @@ async def _submit_flow_to_runner(
 
         parent_flow_run_context = FlowRunContext.get()
 
-        task_inputs: dict[str, list[TaskRunResult | Parameter | Constant]] = {
-            k: list(await collect_task_run_inputs(v)) for k, v in parameters.items()
-        }
+        task_inputs: dict[
+            str, list[Union[TaskRunResult, FlowRunResult, Parameter, Constant]]
+        ] = {k: list(await collect_task_run_inputs(v)) for k, v in parameters.items()}
         parameters = await resolve_inputs(parameters)
         dummy_task = Task(name=flow.name, fn=flow.fn, version=flow.version)
         parent_task_run = await client.create_task_run(
@@ -124,7 +130,7 @@ def submit_to_runner(
 @deprecated_callable(
     start_date=datetime(2025, 4, 1),
     end_date=datetime(2025, 10, 1),
-    help="Use background tasks (https://docs.prefect.io/v3/develop/deferred-tasks) or `run_deployment` and `.serve` instead of submitting runs to the Runner webserver.",
+    help="Use background tasks (https://docs.prefect.io/v3/concepts/flows-and-tasks#background-tasks) or `run_deployment` and `.serve` instead of submitting runs to the Runner webserver.",
 )
 @sync_compatible
 async def submit_to_runner(
@@ -196,7 +202,7 @@ async def submit_to_runner(
 @deprecated_callable(
     start_date=datetime(2025, 4, 1),
     end_date=datetime(2025, 10, 1),
-    help="Use background tasks (https://docs.prefect.io/v3/develop/deferred-tasks) or `run_deployment` and `.serve` instead of submitting runs to the Runner webserver.",
+    help="Use background tasks (https://docs.prefect.io/v3/concepts/flows-and-tasks#background-tasks) or `run_deployment` and `.serve` instead of submitting runs to the Runner webserver.",
 )
 @sync_compatible
 async def wait_for_submitted_runs(

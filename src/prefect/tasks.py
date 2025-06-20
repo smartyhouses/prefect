@@ -29,16 +29,26 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
-from typing_extensions import Literal, ParamSpec, Self, TypeAlias, TypeIs
+from typing_extensions import (
+    Literal,
+    ParamSpec,
+    Self,
+    Sequence,
+    TypeAlias,
+    TypedDict,
+    TypeIs,
+    Unpack,
+)
 
 import prefect.states
 from prefect._internal.uuid7 import uuid7
+from prefect.assets import Asset
 from prefect.cache_policies import DEFAULT, NO_CACHE, CachePolicy
 from prefect.client.orchestration import get_client
 from prefect.client.schemas import TaskRun
 from prefect.client.schemas.objects import (
+    RunInput,
     StateDetails,
-    TaskRunInput,
     TaskRunPolicy,
     TaskRunResult,
 )
@@ -88,6 +98,65 @@ FutureOrResult: TypeAlias = Union[PrefectFuture[T], T]
 OneOrManyFutureOrResult: TypeAlias = Union[
     FutureOrResult[T], Iterable[FutureOrResult[T]]
 ]
+
+
+class TaskRunNameCallbackWithParameters(Protocol):
+    @classmethod
+    def is_callback_with_parameters(cls, callable: Callable[..., str]) -> TypeIs[Self]:
+        sig = inspect.signature(callable)
+        return "parameters" in sig.parameters
+
+    def __call__(self, parameters: dict[str, Any]) -> str: ...
+
+
+StateHookCallable: TypeAlias = Callable[
+    ["Task[..., Any]", TaskRun, State], Union[Awaitable[None], None]
+]
+RetryConditionCallable: TypeAlias = Callable[
+    ["Task[..., Any]", TaskRun, State], Union[Awaitable[bool], bool]
+]
+TaskRunNameValueOrCallable: TypeAlias = Union[
+    Callable[[], str], TaskRunNameCallbackWithParameters, str
+]
+
+
+class TaskOptions(TypedDict, total=False):
+    """
+    A TypedDict representing all available task configuration options.
+
+    This can be used with `Unpack` to provide type hints for **kwargs.
+    """
+
+    name: Optional[str]
+    description: Optional[str]
+    tags: Optional[Iterable[str]]
+    version: Optional[str]
+    cache_policy: Union[CachePolicy, type[NotSet]]
+    cache_key_fn: Union[
+        Callable[["TaskRunContext", dict[str, Any]], Optional[str]], None
+    ]
+    cache_expiration: Optional[datetime.timedelta]
+    task_run_name: Optional[TaskRunNameValueOrCallable]
+    retries: Optional[int]
+    retry_delay_seconds: Union[
+        float, int, list[float], Callable[[int], list[float]], None
+    ]
+    retry_jitter_factor: Optional[float]
+    persist_result: Optional[bool]
+    result_storage: Optional[ResultStorage]
+    result_serializer: Optional[ResultSerializer]
+    result_storage_key: Optional[str]
+    cache_result_in_memory: bool
+    timeout_seconds: Union[int, float, None]
+    log_prints: Optional[bool]
+    refresh_cache: Optional[bool]
+    on_completion: Optional[list[StateHookCallable]]
+    on_failure: Optional[list[StateHookCallable]]
+    on_rollback: Optional[list[Callable[["Transaction"], None]]]
+    on_commit: Optional[list[Callable[["Transaction"], None]]]
+    retry_condition_fn: Optional[RetryConditionCallable]
+    viz_return_value: Any
+    asset_deps: Optional[list[Union[Asset, str]]]
 
 
 def task_input_hash(
@@ -175,12 +244,17 @@ def _infer_parent_task_runs(
     # tracked within the same flow run.
     if flow_run_context:
         for v in parameters.values():
+            upstream_state = None
+
             if isinstance(v, State):
                 upstream_state = v
             elif isinstance(v, PrefectFuture):
                 upstream_state = v.state
             else:
-                upstream_state = flow_run_context.task_run_results.get(id(v))
+                res = flow_run_context.run_results.get(id(v))
+                if res:
+                    upstream_state, _ = res
+
             if upstream_state and upstream_state.is_running():
                 parents.append(
                     TaskRunResult(id=upstream_state.state_details.task_run_id)
@@ -221,23 +295,6 @@ def _generate_task_key(fn: Callable[..., Any]) -> str:
     )
 
     return f"{qualname}-{code_hash}"
-
-
-class TaskRunNameCallbackWithParameters(Protocol):
-    @classmethod
-    def is_callback_with_parameters(cls, callable: Callable[..., str]) -> TypeIs[Self]:
-        sig = inspect.signature(callable)
-        return "parameters" in sig.parameters
-
-    def __call__(self, parameters: dict[str, Any]) -> str: ...
-
-
-StateHookCallable: TypeAlias = Callable[
-    ["Task[..., Any]", TaskRun, State], Union[Awaitable[None], None]
-]
-TaskRunNameValueOrCallable: TypeAlias = Union[
-    Callable[[], str], TaskRunNameCallbackWithParameters, str
-]
 
 
 class Task(Generic[P, R]):
@@ -311,6 +368,7 @@ class Task(Generic[P, R]):
             should end as failed. Defaults to `None`, indicating the task should always continue
             to its retry policy.
         viz_return_value: An optional value to return when the task dependency tree is visualized.
+        asset_deps: An optional list of upstream assets that this task depends on.
     """
 
     # NOTE: These parameters (types, defaults, and docstrings) should be duplicated
@@ -350,10 +408,9 @@ class Task(Generic[P, R]):
         on_failure: Optional[list[StateHookCallable]] = None,
         on_rollback: Optional[list[Callable[["Transaction"], None]]] = None,
         on_commit: Optional[list[Callable[["Transaction"], None]]] = None,
-        retry_condition_fn: Optional[
-            Callable[["Task[..., Any]", TaskRun, State], bool]
-        ] = None,
+        retry_condition_fn: Optional[RetryConditionCallable] = None,
         viz_return_value: Optional[Any] = None,
+        asset_deps: Optional[list[Union[str, Asset]]] = None,
     ):
         # Validate if hook passed is list and contains callables
         hook_categories = [on_completion, on_failure]
@@ -466,6 +523,10 @@ class Task(Generic[P, R]):
             ):
                 persist_result = True
 
+        # Check for global cache disable setting
+        if settings.tasks.disable_caching:
+            cache_policy = NO_CACHE
+
         if persist_result is False:
             self.cache_policy = None if cache_policy is None else NO_CACHE
             if cache_policy and cache_policy is not NotSet and cache_policy != NO_CACHE:
@@ -543,6 +604,14 @@ class Task(Generic[P, R]):
         self.retry_condition_fn = retry_condition_fn
         self.viz_return_value = viz_return_value
 
+        from prefect.assets import Asset
+
+        self.asset_deps: list[Asset] = (
+            [Asset(key=a) if isinstance(a, str) else a for a in asset_deps]
+            if asset_deps
+            else []
+        )
+
     @property
     def ismethod(self) -> bool:
         return hasattr(self.fn, "__prefect_self__")
@@ -609,10 +678,9 @@ class Task(Generic[P, R]):
         refresh_cache: Union[bool, type[NotSet]] = NotSet,
         on_completion: Optional[list[StateHookCallable]] = None,
         on_failure: Optional[list[StateHookCallable]] = None,
-        retry_condition_fn: Optional[
-            Callable[["Task[..., Any]", TaskRun, State], bool]
-        ] = None,
+        retry_condition_fn: Optional[RetryConditionCallable] = None,
         viz_return_value: Optional[Any] = None,
+        asset_deps: Optional[list[Union[str, Asset]]] = None,
     ) -> "Task[P, R]":
         """
         Create a new task from the current object, updating provided options.
@@ -746,6 +814,7 @@ class Task(Generic[P, R]):
             on_failure=on_failure or self.on_failure_hooks,
             retry_condition_fn=retry_condition_fn or self.retry_condition_fn,
             viz_return_value=viz_return_value or self.viz_return_value,
+            asset_deps=asset_deps or self.asset_deps,
         )
 
     def on_completion(self, fn: StateHookCallable) -> StateHookCallable:
@@ -776,7 +845,7 @@ class Task(Generic[P, R]):
         flow_run_context: Optional[FlowRunContext] = None,
         parent_task_run_context: Optional[TaskRunContext] = None,
         wait_for: Optional[OneOrManyFutureOrResult[Any]] = None,
-        extra_task_inputs: Optional[dict[str, set[TaskRunInput]]] = None,
+        extra_task_inputs: Optional[dict[str, set[RunInput]]] = None,
         deferred: bool = False,
     ) -> TaskRun:
         from prefect.utilities._engine import dynamic_key_for_task_run
@@ -879,11 +948,13 @@ class Task(Generic[P, R]):
         flow_run_context: Optional[FlowRunContext] = None,
         parent_task_run_context: Optional[TaskRunContext] = None,
         wait_for: Optional[OneOrManyFutureOrResult[Any]] = None,
-        extra_task_inputs: Optional[dict[str, set[TaskRunInput]]] = None,
+        extra_task_inputs: Optional[dict[str, set[RunInput]]] = None,
         deferred: bool = False,
     ) -> TaskRun:
         from prefect.utilities._engine import dynamic_key_for_task_run
-        from prefect.utilities.engine import collect_task_run_inputs_sync
+        from prefect.utilities.engine import (
+            collect_task_run_inputs_sync,
+        )
 
         if flow_run_context is None:
             flow_run_context = FlowRunContext.get()
@@ -923,7 +994,7 @@ class Task(Generic[P, R]):
 
                 store = await ResultStore(
                     result_storage=await get_or_create_default_task_scheduling_storage()
-                ).update_for_task(task)
+                ).update_for_task(self)
                 context = serialize_context()
                 data: dict[str, Any] = {"context": context}
                 if parameters:
@@ -959,6 +1030,7 @@ class Task(Generic[P, R]):
                 else None
             )
             task_run_id = id or uuid7()
+
             state = prefect.states.Pending(
                 state_details=StateDetails(
                     task_run_id=task_run_id,
@@ -1463,7 +1535,7 @@ class Task(Generic[P, R]):
         args: Optional[tuple[Any, ...]] = None,
         kwargs: Optional[dict[str, Any]] = None,
         wait_for: Optional[Iterable[PrefectFuture[R]]] = None,
-        dependencies: Optional[dict[str, set[TaskRunInput]]] = None,
+        dependencies: Optional[dict[str, set[RunInput]]] = None,
     ) -> PrefectDistributedFuture[R]:
         """
         Create a pending task run for a task worker to execute.
@@ -1660,8 +1732,9 @@ def task(
     refresh_cache: Optional[bool] = None,
     on_completion: Optional[list[StateHookCallable]] = None,
     on_failure: Optional[list[StateHookCallable]] = None,
-    retry_condition_fn: Literal[None] = None,
+    retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
+    asset_deps: Optional[list[Union[str, Asset]]] = None,
 ) -> Callable[[Callable[P, R]], Task[P, R]]: ...
 
 
@@ -1695,8 +1768,9 @@ def task(
     refresh_cache: Optional[bool] = None,
     on_completion: Optional[list[StateHookCallable]] = None,
     on_failure: Optional[list[StateHookCallable]] = None,
-    retry_condition_fn: Optional[Callable[[Task[P, R], TaskRun, State], bool]] = None,
+    retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
+    asset_deps: Optional[list[Union[str, Asset]]] = None,
 ) -> Callable[[Callable[P, R]], Task[P, R]]: ...
 
 
@@ -1731,8 +1805,9 @@ def task(
     refresh_cache: Optional[bool] = None,
     on_completion: Optional[list[StateHookCallable]] = None,
     on_failure: Optional[list[StateHookCallable]] = None,
-    retry_condition_fn: Optional[Callable[[Task[P, Any], TaskRun, State], bool]] = None,
+    retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
+    asset_deps: Optional[list[Union[str, Asset]]] = None,
 ) -> Callable[[Callable[P, R]], Task[P, R]]: ...
 
 
@@ -1764,8 +1839,9 @@ def task(
     refresh_cache: Optional[bool] = None,
     on_completion: Optional[list[StateHookCallable]] = None,
     on_failure: Optional[list[StateHookCallable]] = None,
-    retry_condition_fn: Optional[Callable[[Task[P, Any], TaskRun, State], bool]] = None,
+    retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
+    asset_deps: Optional[list[Union[str, Asset]]] = None,
 ):
     """
     Decorator to designate a function as a task in a Prefect workflow.
@@ -1826,6 +1902,7 @@ def task(
             should end as failed. Defaults to `None`, indicating the task should always continue
             to its retry policy.
         viz_return_value: An optional value to return when the task dependency tree is visualized.
+        asset_deps: An optional list of upstream assets that this task depends on.
 
     Returns:
         A callable `Task` object which, when called, will submit the task for execution.
@@ -1902,6 +1979,7 @@ def task(
             on_failure=on_failure,
             retry_condition_fn=retry_condition_fn,
             viz_return_value=viz_return_value,
+            asset_deps=asset_deps,
         )
     else:
         return cast(
@@ -1931,5 +2009,32 @@ def task(
                 on_failure=on_failure,
                 retry_condition_fn=retry_condition_fn,
                 viz_return_value=viz_return_value,
+                asset_deps=asset_deps,
             ),
         )
+
+
+class MaterializingTask(Task[P, R]):
+    """
+    A task that materializes Assets.
+
+    Args:
+        assets: List of Assets that this task materializes (can be str or Asset)
+        materialized_by: An optional tool that materialized the asset e.g. "dbt" or "spark"
+        **task_kwargs: All other Task arguments
+    """
+
+    def __init__(
+        self,
+        fn: Callable[P, R],
+        *,
+        assets: Sequence[Union[str, Asset]],
+        materialized_by: str | None = None,
+        **task_kwargs: Unpack[TaskOptions],
+    ):
+        super().__init__(fn=fn, **task_kwargs)
+
+        self.assets: list[Asset] = [
+            Asset(key=a) if isinstance(a, str) else a for a in assets
+        ]
+        self.materialized_by = materialized_by
